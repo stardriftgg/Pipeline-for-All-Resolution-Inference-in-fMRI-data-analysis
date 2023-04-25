@@ -1,0 +1,495 @@
+---
+title: "Pipeline for All-Resolutions Inference (ARI) and permutation based inference (pARI)"
+subtitle: "Applying statistical inference methods in neuro-imaging"
+author: "B.A.A Weeterings"
+date: "16/2/2023"
+output:
+  tufte::tufte_html: default
+  tufte::tufte_handout: default
+---
+
+# Introduction
+This document provides a pipeline to perform All-Resolutions Inference (ARI) and permutation based inference (pARI) on any set of subject's fMRI data. For the purposes of this demo I'll be using the auditory data available through the fMRIdata package or as download from OPENNeuro. Personally I'd used the latter method. The pipeline also has an option to perform a simple simulation (with as signal a square-shaped cluster around the middle of the brain). A little unrealistic perhaps, but it serves the purposes of the research of which this pipeline is a part of (this cluster is particularly easy to implement and manipulate). Three methods for cluster inference on fMRI-data are used. The pipeline also creates stat- and clustermaps in nifti-file format. The final part will contain some hand-calculations performed on the data we received from the cluster inference. The results of pARI are hidden in the online version of this document due to the long computation time, we can look at ARI's results instead as they are comparable enough and will give a sense of fMRI cluster inference at work.
+
+# Preliminaries
+This section covers everything needed before we can begin. Make sure your working directory is such that you have a folder called Pipeline, which will contain: this document (the actual script for the pipeline) as .rmd, a data folder containing the subject files all in nifti-format and a mask in nifti-format as well, an empty stats folder (the pipeline will automatically store all maps and results here) and a R folder with all the .R functions supporting this document. Finally we require the following packages and set the working directory to this Pipeline;
+```{r, results='hide', warning=FALSE}
+# conventional libraries
+#library("fMRIdata") # datasets for playing around
+library("hommel")
+library("pARI")
+library("ARIbrain")
+library("RNifti")
+library("neuRosim")
+
+# from github
+#devtools::install_github('wdweeda/niftiR6')
+#library("niftiR6") # WARNING: this package masks regular RNifti while active
+
+# supportfunctions required as source- or hard-code
+source('R/sim_copes.R')
+source('R/oneSamplePar.R')
+source('R/rowVariance.R')
+source('R/statmap.R')
+source('R/cluster_threshold.R')
+source('R/CountBrainCluster.R')
+
+# parameter set-up; adjust to perform equal analysis throughout for different parameter tuning
+alpha <- 0.05
+thr <- 3.2
+
+# customize to your personal file location and make sure your working directory is set such that it ends in "/Pipeline"
+setwd("~/Documents/MSc/Thesis Project/Pipeline")
+getwd()
+```
+
+# Reading fMRI-data
+This code can be used to "naively" read any nifti file collection into R as long as the filenames contain substring "sub-" for subject, also often called a cope in fMRI-studies. For the demo I'll be using auditory data by Pernet et al. (2015) used to perform cluster analysis for localization of the voice-sensitive ’temporal voice areas’ (TVA) of the human auditory cortex. Data are openly available via openNEURO or alternatively in the fMRIdata-package in R.
+```{r}
+# input should contain one cope for each subject in nifti file format
+# try to "naively" extract every subject labeled as sub-"any number or thing"
+path <- list.files(path = "data", pattern = "sub-", all.files = F, ignore.case = T)
+# create a path for every extracted subject
+for (i in 1:length(path)){
+  path[i] <- paste0("data/", path[i])
+}
+
+# store dimensions based on the first cope; functions as input for Statmap()
+cope <- path[1]
+cope <- RNifti::readNifti(file = cope)
+dimensions <- c(dim(cope)[1], dim(cope)[2], dim(cope)[3])
+
+# fill a list with (all) copes using readNifti
+copes <- list()
+for (i in 1:length(path)){
+#for (i in 1:30){ # temporarily reduce computation time while working with many copes
+  copes[[i]] <- RNifti::readNifti(path[i])
+}
+rm(cope, i) # just keeping the global environment clean
+```
+
+# Create a brain-simulation
+As alternative to using real data, this code can also be used to run a simple brain-simulation. Input for the analysis is the amount of simulations (or when unspecified ten copes are created by default) and a signal and a noise parameter (with the default signal-to-noise ratio being 1:1). A list is created where every cope is represented by one large array. This large array is sorted back into the 3D space of the brain, which for the sake of simplicity receives the same dimensions as the data-sets from the fMRIdata package. The neuRosim-package is used to create spatial noise and fill the array with correlated data. A Gaussian random field is used with a full-width half-maximum (FWHM) of 3; using as rule of thumb for an appropriate FWHM three times the size of, in our case, simulated ”1mm” voxel brain. Signal is added to rows selected around the middle of the brain. Each cope is  written into nifty-format, after which you can continue using the pipeline as if it's a normal dataset.
+```{r, eval=FALSE}
+# use this if you have no copes and like to simulate a few instead
+source('R/sim_copes.R')
+set.seed(9) # change to any seed for replication consistency
+# for simplicity we keep the same dimensions as used in the fMRIdata package
+dimensions <- c(91, 109, 91) # dimensions explicitly needed for statmap()
+# each simulation creates a cope, you can change the signal to noise ratio (SNR)
+copes <- sim_copes(simulations = 50, signal = 25, noise = 5) # adjust for SNR scenario
+```
+
+# Apply a mask to the data
+Data from openNEURO typically come with a mask. Make sure a nifit-file named "mask" is stored within this folder to read it into R. This way we by-pass the need to do our own pre-processing (averaging, estimating the BOLD signal). BOLD-estimation is outside the scope of this project, instead this project focused on the next step of the process; cluster inference and spatial specificity (estimating truly active voxels).
+```{r}
+# a mask to be found in the data folder
+mask <- RNifti::readNifti("data/mask.nii.gz")
+```
+
+# Create a statmap
+From the copes and mask we can construct a statmap; an overlay of Z-values across the brain, again in nifti-format.
+```{r}
+# make sure your personal directory ends with "/Pipeline" beforehand
+path <- paste0(getwd(), "/stats")
+# the Statmap will be stored in the stats folder
+statmap(copes = copes, 
+        alternative = "two.sided", 
+        path = path, 
+        mask = mask, 
+        Pmap = T, 
+        dimensions = dimensions)
+```
+
+# Clusters
+Try and store the Z-and p-map into the stats folder.
+```{r}
+# create an R object from the nifti made by Statmap()
+Statmap <- RNifti::readNifti(file = "stats/Statmap.nii.gz")
+# ignore everything outside the mask
+mask = mask != 0
+Statmap[!mask] = 0
+# masked Statmap
+RNifti::writeNifti(Statmap, file = "stats/Statmap.nii.gz")
+```
+
+Compute brain-clusters depending on threshold parameter-tuning.
+```{r}
+# calculate clusters given pre-specified threshold
+clusters = cluster_threshold(Statmap > thr)
+```
+
+# P-values
+For the ARI and count procedures we will need to read the p-map as nifti-file into R.
+```{r}
+# statmap() has already stored p-values which we can use to store the Pmap
+Pmap <- RNifti::readNifti(file = "stats/Pmap.nii.gz")
+# as single values in one large array
+#p.values = array(data = Pmap, dim = c(dimensions[1], dimensions[2], dimensions[3]))
+```
+
+# pARI Procedure
+```{r, eval=FALSE}
+# perform the Permutation-based ARI using pARIbrain(); WARNING this may take a while
+pARI <- pARI::pARIbrain(copes = copes,
+                        mask = mask,
+                        alpha = alpha,
+                        clusters = clusters)
+# if it's taken a long time it's recommended to save the pARI object
+#save(pARI, file = "pARI_auditory")
+```
+
+# ARI Procedure
+```{r}
+# use p-values (Pmap) to perform ARI procedure
+ARI = ARIbrain::ARI(Pmap = Pmap,
+                    clusters = clusters,
+                    mask = mask,
+                    Statmap = Statmap,
+                    alpha = alpha)
+```
+
+# Count Procedure
+```{r}
+# procedure to count active voxels with a more classic multiple test correction
+m <- length(na.omit(as.vector(Pmap[]))) # size of the multiple testing problem i.e. length of the brain
+# some threshold of choice here, let's say it's bonferoni-like
+alpha.adjust <- (alpha / m)
+# counting active proportions for each cluster
+count.clusters <- CountBrainCluster(Pmap = Pmap, 
+                                    clusters = clusters, 
+                                    alpha = alpha.adjust,
+                                    Statmap = Statmap)
+```
+
+```{r, include=FALSE}
+p.values <- na.omit(as.vector(Pmap[]))
+p.adjust <- p.adjust(p.values, method = "fdr", length(p.values))
+Pmap.adjust <- Pmap
+Pmap.adjust[which(!is.na(Pmap.adjust))] <- p.adjust
+
+fdr.clusters <- CountBrainCluster(Pmap = Pmap.adjust,
+                                  clusters = clusters, 
+                                  alpha = alpha,
+                                  Statmap = Statmap)
+```
+
+# Clustermaps
+The next two sections provide code to transform the created R-objects to files that can by visualized. Sadly this can't be shown directly from this piece of R-markdown, but one visualization-tool used during this project is FSLeyes. It's free to install and use for non-commercial application. Readers interested in the images are referred to the article accompanying this project.
+```{r, eval=FALSE}
+# extract clusters from pARI object
+pARI.clusters <- pARI$clusters
+# from clusters to clustermap
+library("niftiR6")
+dat <- niftiR6::readNifti('stats/Statmap.nii.gz')
+dat2 <- dat$clone()
+dat2$data <- pARI$clustersy
+dat2$changeName('pARI_clusters')
+niftiR6::writeNifti(dat2)
+rm(dat, dat2)
+```
+
+# True Discovery Proportion Brain Maps
+```{r, eval=FALSE}
+# TDP map for pARI
+source('R/map_TDP.R')
+path <- paste0(getwd(), "/stats")
+map_TDP(pARI, path = path, name = "TDPclusters_pARI", "stats/newstandard.nii.gz")
+#map_TDP(pARI, path = path, name = "TDPclusters_pARI", mask)
+```
+
+We can inspect a summary for some clusters with a TDP of above 70 percent.
+```{r, warning=FALSE}
+# clustermap procedure for ARI
+ARI.clusters <- ARIBrainCluster(Pmap = Pmap, mask = mask)
+# find all maximal clusters given a TDP threshold
+tdp.clusters <- TDPQuery(ARI.clusters, threshold = 0.7)
+summaryClusters(ARI.clusters, tdp.clusters, rest = T)
+```
+
+```{r, eval=FALSE}
+writeClusters(tdp.clusters, 
+              file = "stats/TDPclusters_ARI.nii.gz",
+              template = "stats/newstandard.nii.gz")
+```
+
+# Analysis of data applications
+For the article I studied the auditory, arrow, food, and rhyme data. Here are some handcalculations are shown that supported the article. The results from discovered clusters are used to make a comparison between ARI and pARI. Note ggplot is required to create the plots;
+```{r}
+library("ggplot2")
+library("dplyr")
+library("viridis")
+#options(scipen=999)
+```
+
+Creating a quick dataframe for TDP's of ARI, pARI and corresponding cluster size, followed by a quick overview of all clusters in comparison of ARI versus pARI.
+```{r}
+data <- c(# auditory data
+          0.9181, 0.9501, 31427, # TDP of ARI, pARI and corresponding cluster size
+          0.5430, 0.6493, 442, 
+          0.2082, 0.2565, 269,
+          0.1514, 0.2231, 251,
+          # arrow data
+          0.8044, 0.9334, 69947,
+          0.0000, 0.0000, 424,
+          0.0000, 0.0143, 140,
+          # food data
+          0.0852, 0.2894, 3331,
+          0.3348, 0.4750, 3023,
+          0.0000, 0.0000, 223,
+          0.0000, 0.0000, 134,
+          # rhyme data
+          0.3817, 0.6748, 34115,
+          0.0000, 0.0000, 1546,
+          0.0000, 0.0000, 606,
+          0.0000, 0.0000, 158)
+data <- matrix(data, ncol = 3, byrow = T)
+df <- data.frame(data)
+# nice visualisation
+ggplot(df) +
+  geom_point(data = df, aes(x = X1, y = X2, size = X3), shape = 16, color='Purple') +
+  scale_size_continuous(range = c(5, 10)) +
+  geom_abline(color="orange") +
+  labs(x = "% active (ARI)", y = "% active (pARI)", size = "Cluster size")
+```
+
+Already we can see pARI correlates slightly higher with regards to cluster size;
+```{r}
+cor(df$X1,df$X3) # correlation ARI and cluster size
+cor(df$X2,df$X3) # correlation pARI and size
+```
+
+# Analysis of the simulation study
+What's included in the following dataframe are repeated simulations of twenty copes, with ten repetitions for each condition; SNR 5:1, 10:1, threshold 2.3, 3.2, 4.2. A bit tedious, but the data were constructed by storing simulations as .Rdata and then extracting the TDP's for ARI, pARI and the count procedure.
+```{r}
+df <- data.frame(TDP = 0.3363119, 
+                 Method = factor("pARI", levels=c("Count","ARI","pARI")),
+                 Threshold = factor("2.3", levels=c("2.3","3.2","4.2")),
+                 SNR = factor("5:1", levels=c("5:1","10:1")))
+  df[nrow(df) + 1,] <- list(0.272997, "pARI", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.327953, "pARI", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.238594, "pARI", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.350677, "pARI", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.302963, "pARI", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.320917, "pARI", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.214497, "pARI", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.206997, "pARI", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.246515, "pARI", "2.3", "5:1")
+  
+  df[nrow(df) + 1,] <- list(0.338749, "ARI", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.247033, "ARI", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.317682, "ARI", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.258040, "ARI", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.352815, "ARI", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.309630, "ARI", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.322350, "ARI", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.223373, "ARI", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.198251, "ARI", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.213500, "ARI", "2.3", "5:1")
+                            
+  df[nrow(df) + 1,] <- list(0.03249390, "Count", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.01038576, "Count", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.01834189, "Count", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.01495886, "Count", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.01924448, "Count", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.01851852, "Count", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.01790831, "Count", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.01257396, "Count", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.00947522, "Count", "2.3", "5:1")
+  df[nrow(df) + 1,] <- list(0.01100514, "Count", "2.3", "5:1")
+  # pARI.SNR5.th3.2
+  df[nrow(df) + 1,] <- list(0.3363119, "pARI", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.2803514, "pARI", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.2642245, "pARI", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.2408759, "pARI", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.2992985, "pARI", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.2273819, "pARI", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.3040323, "pARI", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.3387471, "pARI", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.2516077, "pARI", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.3281005, "pARI", "3.2", "5:1")
+  # ARI.SNR5.th3.2
+  df[nrow(df) + 1,] <- list(0.3387490, "ARI", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.2683706, "ARI", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.2915043, "ARI", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.2538524, "ARI", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.2821512, "ARI", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.2145717, "ARI", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.3080645, "ARI", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.3379737, "ARI", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.2459807, "ARI", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.2794349, "ARI", "3.2", "5:1")
+  # count.SNR5.th3.2 
+  df[nrow(df) + 1,] <- list(0.03249391, "Count", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.01837061, "Count", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.01091193, "Count", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.00486618, "Count", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.00935308, "Count", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.01361089, "Count", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.02096774, "Count", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.02088167, "Count", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.01125402, "Count", "3.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.01883830, "Count", "3.2", "5:1")
+  # pARI.SNR5.th4.2 
+  df[nrow(df) + 1,] <- list(0.2670213, "pARI", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.4263415, "pARI", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.3069519, "pARI", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.3991727, "pARI", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.4368030, "pARI", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.3283283, "pARI", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.3274244, "pARI", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.3972093, "pARI", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.3932927, "pARI", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.4131980, "pARI", "4.2", "5:1")
+  # ARI.SNR5.th4.2  
+  df[nrow(df) + 1,] <- list(0.2744681, "ARI", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.3892683, "ARI", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.3048128, "ARI", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.3805584, "ARI", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.4219331, "ARI", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.3313313, "ARI", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.3534932, "ARI", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.3944186, "ARI", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.4065041, "ARI", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.3705584, "ARI", "4.2", "5:1")
+  # count.SNR5.th4.2
+  df[nrow(df) + 1,] <- list(0.01914894, "Count", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.03121951, "Count", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.01711230, "Count", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.03412616, "Count", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.01951673, "Count", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.01501502, "Count", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.03023983, "Count", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.01860465, "Count", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.01727642, "Count", "4.2", "5:1")
+  df[nrow(df) + 1,] <- list(0.02538071, "Count", "4.2", "5:1")
+  # SNR10
+  df[nrow(df) + 1,] <- list(0.9533528, "pARI", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.9688658, "pARI", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.9540816, "pARI", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.9507246, "pARI", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.9505095, "pARI", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.9625000, "pARI", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.9328571, "pARI", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.9761727, "pARI", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.9500724, "pARI", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.9377237, "pARI", "2.3", "10:1")
+  # ARI.SNR10.th2.3   
+  df[nrow(df) + 1,] <- list(0.9533528, "ARI", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.9703484, "ARI", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.9555394, "ARI", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.9514493, "ARI", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.9519651, "ARI", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.9610294, "ARI", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.9307143, "ARI", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.9754281, "ARI", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.9486252, "ARI", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.9391553, "ARI", "2.3", "10:1")
+  # count.SNR10.th2.3 
+  df[nrow(df) + 1,] <- list(0.7463557, "Count", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.8339511, "Count", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.7981050, "Count", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.7782609, "Count", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.7838428, "Count", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.7735294, "Count", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.7892857, "Count", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.7930007, "Count", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.7981187, "Count", "2.3", "10:1")
+  df[nrow(df) + 1,] <- list(0.7816750, "Count", "2.3", "10:1")
+  # pARI.SNR10.th3.2  
+  df[nrow(df) + 1,] <- list(0.9806259, "pARI", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9774944, "pARI", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9738416, "pARI", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9738611, "pARI", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9842579, "pARI", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9857250, "pARI", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9857357, "pARI", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9695846, "pARI", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9842342, "pARI", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9739389, "pARI", "3.2", "10:1")
+  # ARI.SNR10.th3.2   
+  df[nrow(df) + 1,] <- list(0.9783905, "ARI", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9774944, "ARI", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9790732, "ARI", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9731143, "ARI", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9835083, "ARI", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9864763, "ARI", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9834835, "ARI", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9732938, "ARI", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9849850, "ARI", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9754281, "ARI", "3.2", "10:1")
+  # count.SNR10.th3.2 
+  df[nrow(df) + 1,] <- list(0.8435171, "Count", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.7884471, "Count", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.8295964, "Count", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.8289768, "Count", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.8125937, "Count", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.8407213, "Count", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.8370871, "Count", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.8041543, "Count", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.8243243, "Count", "3.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.7900223, "Count", "3.2", "10:1")
+  # pARI.SNR10.th4.2  
+  df[nrow(df) + 1,] <- list(0.9797145, "pARI", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9722014, "pARI", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9864865, "pARI", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9789632, "pARI", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9812171, "pARI", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9849962, "pARI", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9902402, "pARI", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9751880, "pARI", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9849737, "pARI", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9864763, "pARI", "4.2", "10:1")
+  # ARI.SNR10.th4.2   
+  df[nrow(df) + 1,] <- list(0.9812171, "ARI", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9759579, "ARI", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9857357, "ARI", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9774606, "ARI", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9804658, "ARI", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9834959, "ARI", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9879880, "ARI", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9736842, "ARI", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9849737, "ARI", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.9842224, "ARI", "4.2", "10:1")
+  # count.SNR10.th4.2 
+  df[nrow(df) + 1,] <- list(0.7993989, "Count", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.8377160, "Count", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.8160661, "Count", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.7971450, "Count", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.7851240, "Count", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.8454614, "Count", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.8130631, "Count", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.7977444, "Count", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.8602554, "Count", "4.2", "10:1")
+  df[nrow(df) + 1,] <- list(0.8407213, "Count", "4.2", "10:1")
+```
+
+Visualizing the relationship between TDP and SNR, cluster-threshold and method;
+```{r}
+ggplot(data = df, aes(x = Threshold, y = TDP, color = Method)) +
+    geom_boxplot() +
+    facet_wrap(~SNR, ncol = 2) +
+    scale_color_viridis(discrete = TRUE) +
+    ylab("TDP")
+```
+
+To support the findings in a more statistically valid fashion we can easily check the results by testing effects with ANOVA and fitting a linear model;
+```{r}
+lm <- lm(TDP ~ Threshold + Method + SNR + Threshold*Method + Threshold*SNR +
+          Method*SNR, data = df)
+(anova <- anova(lm))
+summary(lm)
+```
+
+ANOVA shows all interactions are significant, however the accompanying model is a little complex with regards to interpretation of all interactions. Notice not all interactions between method and threshold are significant, therefore it may be worthwhile to reduce the model for something a little more simple while the R-square i.e. model fit barely changes;
+```{r}
+lm <- lm(TDP ~ Threshold + Method + SNR + Threshold*SNR + Method*SNR, data = df)
+(anova <- anova(lm))
+summary(lm)
+```
+
+The model is confirmation for the TDP changes we see in the boxplot. At the strong signal level (10:1) increasing the threshold from 2.3 to 3.2 increases the TDP at first, while increasing the threshold further to 4.2 makes no difference anymore. Compared to the 5:1 level where the difference between threshold 2.3 and 3.2 is small, while increasing the threshold to 4.2 makes a bigger difference. Finally the count procedure gains much more from a high SNR then ARI and pARI; the increase in TDP is about 13\% less for the latter two. Note if we subtract the two coefficients the TDP difference between ARI and pARI itself is only 0.05\%.
+
+# References
+
+[1] Antonio, N., de Almeida, A., & Nunes, L. (2019a). Hotel booking demand datasets. Data in brief, 22, 41-49.
